@@ -65,30 +65,31 @@ MIN_RAM_DATANODE_GB_WARN=16
 # State variables (preflight)
 # ==================================================
 ROLE=""
-AVX_SUPPORTED="no"
-JAVA_PRESENT="no"
+
+UBUNTU_VERSION="unknown"
+AVX_SUPPORTED="unknown"
+JAVA_PRESENT="unknown"
 JAVA_VERSION="n/a"
 
 CURRENT_TZ="unknown"
 NTP_SYNC="unknown"
 CURRENT_MAX_MAP_COUNT="unknown"
-UBUNTU_VERSION="unknown"
 
-# Network snapshot
-DEFAULT_GW="none"
-PRIMARY_IFACES=""
-IFACE_SUMMARY="n/a"
-DHCP_DETECTED="unknown"
-DNS_OK="no"
-HTTP_ARCHIVE_OK="no"
-ICMP_ARCHIVE_OK="unknown"
-
-# Hardware snapshot
 CPU_CORES="unknown"
 RAM_GB="unknown"
 SWAP_GB="unknown"
+
 ROOT_FREE_GB="unknown"
 EXTRA_DISKS_FOUND="unknown"
+
+DEFAULT_GW="unknown"
+IFACE_SUMMARY="unknown"
+PRIMARY_IFACES="unknown"
+DHCP_DETECTED="unknown"
+
+DNS_OK="unknown"
+HTTP_ARCHIVE_OK="unknown"
+ICMP_ARCHIVE_OK="unknown"
 
 # Findings
 FAILS=()
@@ -115,7 +116,10 @@ confirm() {
   [[ "$reply" == "yes" ]]
 }
 
-# Status line helpers (UI)
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
 ui_step() {
   echo "${C_CYAN}${C_BOLD}>>${C_RESET} $1"
   log "PRECHECK: $1"
@@ -126,13 +130,28 @@ ui_warn() { echo "   ${C_YELLOW}WARN${C_RESET} $1"; }
 ui_fail() { echo "   ${C_RED}FAIL${C_RESET} $1"; }
 
 # ==================================================
-# Core preflight checks (hard gates)
+# Preflight: base checks (read-only)
 # ==================================================
 check_os() {
+  if [[ ! -r /etc/os-release ]]; then
+    add_fail "/etc/os-release not found; cannot determine OS."
+    return
+  fi
+
+  # shellcheck disable=SC1091
   source /etc/os-release
-  [[ "${ID:-}" == "ubuntu" ]] || add_fail "Unsupported OS: ${ID:-unknown}"
-  [[ "${VERSION_ID:-}" == "22.04" || "${VERSION_ID:-}" == "24.04" ]] || add_fail "Unsupported Ubuntu version: ${VERSION_ID:-unknown}"
-  [[ "$(uname -m)" == "x86_64" ]] || add_fail "Unsupported architecture: $(uname -m)"
+
+  if [[ "${ID:-}" != "ubuntu" ]]; then
+    add_fail "Unsupported OS: ${ID:-unknown} (supported: Ubuntu 22.04/24.04)"
+  fi
+
+  if [[ "${VERSION_ID:-}" != "22.04" && "${VERSION_ID:-}" != "24.04" ]]; then
+    add_fail "Unsupported Ubuntu version: ${VERSION_ID:-unknown} (supported: 22.04/24.04)"
+  fi
+
+  if [[ "$(uname -m)" != "x86_64" ]]; then
+    add_fail "Unsupported architecture: $(uname -m) (supported: x86_64)"
+  fi
 
   if command -v lsb_release >/dev/null 2>&1; then
     UBUNTU_VERSION="$(lsb_release -rs 2>/dev/null || echo "${VERSION_ID:-unknown}")"
@@ -142,24 +161,24 @@ check_os() {
 }
 
 check_systemd() {
-  command -v systemctl >/dev/null 2>&1 || add_fail "systemd not found (systemctl missing)"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    add_fail "systemd not found (systemctl missing)."
+  fi
 }
 
-apt_lock_holders() {
-  local lockfile="$1"
-  fuser -v "$lockfile" 2>/dev/null || true
-}
-
+# --------------------------------------------------
+# Apt lock check (bounded wait)
+# --------------------------------------------------
 apt_is_locked() {
-  local locked="no"
+  local lf
   for lf in /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock; do
     if [[ -e "$lf" ]]; then
       if fuser "$lf" >/dev/null 2>&1; then
-        locked="yes"
+        return 0
       fi
     fi
   done
-  [[ "$locked" == "yes" ]]
+  return 1
 }
 
 check_apt_with_wait() {
@@ -167,18 +186,11 @@ check_apt_with_wait() {
 
   if apt_is_locked; then
     add_warn "apt/dpkg appears locked (apt-daily/unattended-upgrades). Will wait up to ${APT_LOCK_WAIT_SECONDS}s."
-    for lf in /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock; do
-      [[ -e "$lf" ]] || continue
-      if fuser "$lf" >/dev/null 2>&1; then
-        add_info "Lock holders for $lf (see logfile)."
-        apt_lock_holders "$lf" | tee -a "$LOGFILE" >/dev/null
-      fi
-    done
   fi
 
   while apt_is_locked; do
     if (( waited >= APT_LOCK_WAIT_SECONDS )); then
-      add_fail "apt is locked by another process (waited ${APT_LOCK_WAIT_SECONDS}s). Retry after apt-daily/unattended-upgrades completes."
+      add_fail "apt is locked by another process (waited ${APT_LOCK_WAIT_SECONDS}s). Retry after background apt jobs complete."
       return
     fi
     sleep "$APT_LOCK_SLEEP_SECONDS"
@@ -186,6 +198,9 @@ check_apt_with_wait() {
   done
 }
 
+# --------------------------------------------------
+# Role selection
+# --------------------------------------------------
 select_role() {
   echo
   echo "${C_BOLD}Select host role:${C_RESET}"
@@ -196,20 +211,34 @@ select_role() {
   case "$choice" in
     1) ROLE="server" ;;
     2) ROLE="datanode" ;;
-    *) add_fail "Invalid role selection" ;;
+    *) add_fail "Invalid role selection." ;;
   esac
 
-  [[ -n "$ROLE" ]] && add_info "Role selected: $ROLE"
+  if [[ -n "$ROLE" ]]; then
+    add_info "Role selected: $ROLE"
+  fi
 }
 
+# --------------------------------------------------
+# Clean-install enforcement
+# --------------------------------------------------
 inspect_existing_software() {
-  command -v mongod >/dev/null 2>&1 && add_fail "MongoDB already installed (clean install required)."
-  dpkg -l 2>/dev/null | grep -q graylog && add_fail "Graylog packages already installed (clean install required)."
-  systemctl list-unit-files 2>/dev/null | grep -q graylog && add_fail "Graylog services already present (clean install required)."
+  if command -v mongod >/dev/null 2>&1; then
+    add_fail "MongoDB already installed (clean install required)."
+  fi
+
+  # dpkg grep must be inside if; no pipefail surprises
+  if dpkg -l 2>/dev/null | grep -qE '^(ii|hi)\s+graylog'; then
+    add_fail "Graylog packages already installed (clean install required)."
+  fi
+
+  if systemctl list-unit-files 2>/dev/null | grep -q 'graylog'; then
+    add_fail "Graylog services already present (clean install required)."
+  fi
 }
 
 # ==================================================
-# Read-only inspections
+# Preflight: inspections (read-only, resilient)
 # ==================================================
 inspect_time() {
   if command -v timedatectl >/dev/null 2>&1; then
@@ -237,9 +266,11 @@ inspect_avx() {
     AVX_SUPPORTED="n/a"
     return
   fi
+
   if grep -q avx /proc/cpuinfo 2>/dev/null; then
     AVX_SUPPORTED="yes"
   else
+    AVX_SUPPORTED="no"
     add_fail "CPU lacks AVX support (required for MongoDB 8.x)."
   fi
 }
@@ -250,8 +281,9 @@ inspect_hardware() {
   if [[ -r /proc/meminfo ]]; then
     local mem_kb swap_kb
     mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-    RAM_GB="$(( (mem_kb + 1024*1024 - 1) / (1024*1024) ))"
     swap_kb="$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+
+    RAM_GB="$(( (mem_kb + 1024*1024 - 1) / (1024*1024) ))"
     SWAP_GB="$(( (swap_kb + 1024*1024 - 1) / (1024*1024) ))"
   fi
 }
@@ -259,29 +291,37 @@ inspect_hardware() {
 inspect_disk() {
   ROOT_FREE_GB="$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}' || echo "unknown")"
 
+  # Extra disk heuristic: any disk device excluding root’s parent disk
   local root_src root_base
   root_src="$(findmnt -n -o SOURCE / 2>/dev/null || echo "")"
   root_base="$(lsblk -no PKNAME "$root_src" 2>/dev/null || true)"
 
-  local disks
+  local disks count d
   disks="$(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' || true)"
+
   if [[ -z "$disks" ]]; then
     EXTRA_DISKS_FOUND="no"
     return
   fi
 
-  local count=0
+  count=0
   for d in $disks; do
     if [[ -n "$root_base" && "$d" == "$root_base" ]]; then
       continue
     fi
     count=$((count+1))
   done
-  EXTRA_DISKS_FOUND=$([[ $count -gt 0 ]] && echo "yes" || echo "no")
+
+  if (( count > 0 )); then
+    EXTRA_DISKS_FOUND="yes"
+  else
+    EXTRA_DISKS_FOUND="no"
+  fi
 }
 
 evaluate_hardware_requirements() {
-  if [[ "$ROOT_FREE_GB" != "unknown" ]]; then
+  # Root free
+  if is_uint "$ROOT_FREE_GB"; then
     if (( ROOT_FREE_GB < MIN_ROOT_FREE_GB_FAIL )); then
       add_fail "Low free space on / (${ROOT_FREE_GB}G). Require at least ${MIN_ROOT_FREE_GB_FAIL}G free."
     elif (( ROOT_FREE_GB < MIN_ROOT_FREE_GB_WARN )); then
@@ -291,21 +331,34 @@ evaluate_hardware_requirements() {
     add_warn "Could not determine free space on /."
   fi
 
+  # CPU/RAM warnings per role
   if [[ "$ROLE" == "server" ]]; then
-    [[ "$CPU_CORES" != "unknown" && "$CPU_CORES" -lt "$MIN_CPU_SERVER_WARN" ]] && add_warn "CPU cores: ${CPU_CORES} (recommended >= ${MIN_CPU_SERVER_WARN} for server)."
-    [[ "$RAM_GB" != "unknown" && "$RAM_GB" -lt "$MIN_RAM_SERVER_GB_WARN" ]] && add_warn "RAM: ${RAM_GB}G (recommended >= ${MIN_RAM_SERVER_GB_WARN}G for server)."
+    if is_uint "$CPU_CORES" && (( CPU_CORES < MIN_CPU_SERVER_WARN )); then
+      add_warn "CPU cores: ${CPU_CORES} (recommended >= ${MIN_CPU_SERVER_WARN} for server)."
+    fi
+    if is_uint "$RAM_GB" && (( RAM_GB < MIN_RAM_SERVER_GB_WARN )); then
+      add_warn "RAM: ${RAM_GB}G (recommended >= ${MIN_RAM_SERVER_GB_WARN}G for server)."
+    fi
   elif [[ "$ROLE" == "datanode" ]]; then
-    [[ "$CPU_CORES" != "unknown" && "$CPU_CORES" -lt "$MIN_CPU_DATANODE_WARN" ]] && add_warn "CPU cores: ${CPU_CORES} (recommended >= ${MIN_CPU_DATANODE_WARN} for data node)."
-    [[ "$RAM_GB" != "unknown" && "$RAM_GB" -lt "$MIN_RAM_DATANODE_GB_WARN" ]] && add_warn "RAM: ${RAM_GB}G (recommended >= ${MIN_RAM_DATANODE_GB_WARN}G for data node)."
-    [[ "$EXTRA_DISKS_FOUND" == "no" ]] && add_warn "No additional disk detected (data nodes should have a dedicated data disk)."
+    if is_uint "$CPU_CORES" && (( CPU_CORES < MIN_CPU_DATANODE_WARN )); then
+      add_warn "CPU cores: ${CPU_CORES} (recommended >= ${MIN_CPU_DATANODE_WARN} for data node)."
+    fi
+    if is_uint "$RAM_GB" && (( RAM_GB < MIN_RAM_DATANODE_GB_WARN )); then
+      add_warn "RAM: ${RAM_GB}G (recommended >= ${MIN_RAM_DATANODE_GB_WARN}G for data node)."
+    fi
+    if [[ "$EXTRA_DISKS_FOUND" == "no" ]]; then
+      add_warn "No additional disk detected (data nodes should have a dedicated data disk)."
+    fi
   fi
 
-  if [[ "$SWAP_GB" != "unknown" && "$SWAP_GB" -eq 0 ]]; then
+  if is_uint "$SWAP_GB" && (( SWAP_GB == 0 )); then
     add_warn "Swap is 0G (not always required, but can help stability under memory pressure)."
   fi
 }
 
-# Network checks (simple & critical)
+# ==================================================
+# Network checks (minimal but critical)
+# ==================================================
 inspect_network() {
   if command -v ip >/dev/null 2>&1; then
     IFACE_SUMMARY="$(ip -br addr 2>/dev/null | awk '$1!="lo"{print}' | sed 's/[[:space:]]\+/ /g' || true)"
@@ -313,6 +366,7 @@ inspect_network() {
     DEFAULT_GW="$(ip route show default 2>/dev/null | awk 'NR==1{print $3}' || echo "none")"
   fi
 
+  # DHCP detection (netplan signal)
   if ls /etc/netplan/*.yaml >/dev/null 2>&1; then
     if grep -R "dhcp4:\s*true" /etc/netplan/*.yaml >/dev/null 2>&1; then
       DHCP_DETECTED="yes"
@@ -323,12 +377,28 @@ inspect_network() {
     DHCP_DETECTED="unknown"
   fi
 
-  local ipv4_count
-  ipv4_count="$(ip -4 -br addr 2>/dev/null | awk '$1!="lo" && $3!=""{c++} END{print c+0}' || echo 0)"
-  (( ipv4_count == 0 )) && add_fail "No IPv4 address configured on non-loopback interfaces."
-  [[ "$DEFAULT_GW" == "none" || -z "$DEFAULT_GW" ]] && add_fail "No default gateway configured (no default route)."
-  [[ "$DHCP_DETECTED" == "yes" ]] && add_warn "DHCP appears enabled in netplan (not ideal for server deployments)."
-  [[ -z "${PRIMARY_IFACES:-}" ]] && add_warn "No UP ethernet interfaces detected (excluding lo)."
+  # Basic IP and gateway
+  if command -v ip >/dev/null 2>&1; then
+    local ipv4_count
+    ipv4_count="$(ip -4 -br addr 2>/dev/null | awk '$1!="lo" && $3!=""{c++} END{print c+0}' || echo 0)"
+    if ! is_uint "$ipv4_count" || (( ipv4_count == 0 )); then
+      add_fail "No IPv4 address configured on non-loopback interfaces."
+    fi
+  else
+    add_fail "'ip' command not available; cannot validate network configuration."
+  fi
+
+  if [[ "$DEFAULT_GW" == "none" || -z "$DEFAULT_GW" || "$DEFAULT_GW" == "unknown" ]]; then
+    add_fail "No default gateway configured (no default route)."
+  fi
+
+  if [[ "$DHCP_DETECTED" == "yes" ]]; then
+    add_warn "DHCP appears enabled in netplan (not ideal for server deployments)."
+  fi
+
+  if [[ -z "${PRIMARY_IFACES:-}" || "${PRIMARY_IFACES:-}" == "unknown" ]]; then
+    add_warn "No UP ethernet interfaces detected (excluding lo)."
+  fi
 }
 
 check_dns_archive() {
@@ -341,6 +411,7 @@ check_dns_archive() {
 }
 
 check_connectivity_archive() {
+  # Primary indicator: HTTP HEAD (ICMP may be blocked)
   if command -v curl >/dev/null 2>&1; then
     if curl -fsSLI --max-time 8 http://archive.ubuntu.com/ubuntu/ >/dev/null 2>&1; then
       HTTP_ARCHIVE_OK="yes"
@@ -349,9 +420,11 @@ check_connectivity_archive() {
       add_warn "HTTP connectivity to archive.ubuntu.com/ubuntu failed (proxy/firewall?)."
     fi
   else
-    add_warn "curl not installed; cannot test HTTP connectivity in preflight."
+    HTTP_ARCHIVE_OK="unknown"
+    add_warn "curl not installed; HTTP connectivity test skipped in preflight."
   fi
 
+  # ICMP informational only
   if command -v ping >/dev/null 2>&1; then
     if ping -c 1 -W 1 archive.ubuntu.com >/dev/null 2>&1; then
       ICMP_ARCHIVE_OK="yes"
@@ -360,11 +433,13 @@ check_connectivity_archive() {
       ICMP_ARCHIVE_OK="no"
       add_info "ICMP ping to archive.ubuntu.com failed (may be blocked; not a failure)."
     fi
+  else
+    ICMP_ARCHIVE_OK="unknown"
   fi
 }
 
 # ==================================================
-# Preflight report (color-coded, readable)
+# Report & gate
 # ==================================================
 print_preflight_report() {
   echo
@@ -389,7 +464,7 @@ print_preflight_report() {
   echo "  HTTP archive:      ${HTTP_ARCHIVE_OK}"
   echo "  ICMP archive:      ${ICMP_ARCHIVE_OK}"
   echo "  Interfaces:"
-  echo "${IFACE_SUMMARY:-n/a}" | sed 's/^/    /'
+  echo "${IFACE_SUMMARY:-unknown}" | sed 's/^/    /'
   echo
   echo "${C_BOLD}Runtime${C_RESET}"
   echo "  Timezone:          ${CURRENT_TZ}"
@@ -481,6 +556,7 @@ apply_vm_max_map_count() {
 
 install_java_21() {
   log "Installing Java 21"
+  # apt lock may appear between preflight and install; re-check here
   check_apt_with_wait
   apt update
   apt install -y "$JAVA_PACKAGE"
@@ -488,9 +564,15 @@ install_java_21() {
 
 verify_prerequisites() {
   if command -v timedatectl >/dev/null 2>&1; then
-    [[ "$(timedatectl show --property=Timezone --value 2>/dev/null || echo "")" == "$REQUIRED_TZ" ]] || fatal "Timezone not applied"
+    local tz_now
+    tz_now="$(timedatectl show --property=Timezone --value 2>/dev/null || echo "")"
+    [[ "$tz_now" == "$REQUIRED_TZ" ]] || fatal "Timezone not applied"
   fi
-  [[ "$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)" -ge "$REQUIRED_MAX_MAP_COUNT" ]] || fatal "vm.max_map_count not applied"
+
+  local mmc
+  mmc="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
+  is_uint "$mmc" && (( mmc >= REQUIRED_MAX_MAP_COUNT )) || fatal "vm.max_map_count not applied"
+
   java -version >/dev/null 2>&1 || fatal "Java verification failed"
 }
 
@@ -509,7 +591,7 @@ main() {
   check_os
   check_systemd
   check_apt_with_wait
-  ui_ok "Base OS checks completed"
+  ui_ok "Base checks completed"
 
   select_role
 
