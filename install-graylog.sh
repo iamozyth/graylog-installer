@@ -12,12 +12,10 @@ REQUIRED_MAX_MAP_COUNT=262144
 JAVA_PACKAGE="openjdk-21-jre-headless"
 
 # ==================================================
-# State variables (read-only phase)
+# State variables (preflight)
 # ==================================================
 ROLE=""
 AVX_SUPPORTED="no"
-MONGODB_PRESENT="no"
-GRAYLOG_PRESENT="no"
 JAVA_PRESENT="no"
 JAVA_VERSION="n/a"
 
@@ -122,15 +120,13 @@ preflight_summary() {
     echo "vm.max_map_count     : $CURRENT_MAX_MAP_COUNT"
     echo "Java present         : $JAVA_PRESENT"
     echo "Java version         : $JAVA_VERSION"
-    echo "MongoDB installed    : NO"
-    echo "Graylog installed    : NO"
     echo "-------------------------------------------------"
-    echo "The following changes WILL be applied:"
-    echo "- Timezone → $REQUIRED_TZ"
-    echo "- NTP configuration"
-    echo "- vm.max_map_count → $REQUIRED_MAX_MAP_COUNT"
+    echo "The following actions WILL be performed:"
+    echo "- Set timezone → $REQUIRED_TZ"
+    echo "- Configure NTP"
+    echo "- Set vm.max_map_count → $REQUIRED_MAX_MAP_COUNT"
     echo "- Install Java 21"
-    [[ "$ROLE" == "server" ]] && echo "- Install MongoDB 8.x (next phase)"
+    [[ "$ROLE" == "server" ]] && echo "- Install MongoDB 8.x + replica set"
     echo "================================================="
     echo
 }
@@ -146,7 +142,7 @@ confirm_proceed() {
 }
 
 # ==================================================
-# Phase 3 – Prerequisite correction (WRITE)
+# Phase 3 – Prerequisite correction
 # ==================================================
 apply_timezone() {
     log "Setting timezone to $REQUIRED_TZ"
@@ -162,7 +158,7 @@ configure_ntp() {
 
     if [[ "$choice" == "2" ]]; then
         read -r -p "Enter space-separated NTP servers: " ntp
-        [[ -n "$ntp" ]] || fatal "No NTP servers provided"
+        [[ -z "$ntp" ]] && fatal "No NTP servers provided"
     else
         ntp="$DEFAULT_NTP_SERVERS"
     fi
@@ -197,11 +193,94 @@ verify_prerequisites() {
 }
 
 # ==================================================
+# Phase 4 – MongoDB 8.x installation (server only)
+# ==================================================
+install_mongodb_prereqs() {
+    log "Installing MongoDB prerequisites"
+    apt install -y gnupg curl
+}
+
+add_mongodb_repo() {
+    log "Adding MongoDB 8.0 repository"
+
+    curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | \
+        gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+
+    echo "deb [ arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] \
+https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" \
+        >/etc/apt/sources.list.d/mongodb-org-8.0.list
+
+    apt update
+}
+
+install_mongodb() {
+    log "Installing MongoDB 8.x"
+    apt install -y mongodb-org
+    apt-mark hold mongodb-org
+}
+
+configure_mongodb() {
+    log "Configuring MongoDB"
+    cp /etc/mongod.conf /etc/mongod.conf.graylog.bak
+
+    cat >/etc/mongod.conf <<EOF
+storage:
+  dbPath: /var/lib/mongodb
+
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+
+net:
+  port: 27017
+  bindIpAll: true
+
+replication:
+  replSetName: "rs0"
+
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+EOF
+}
+
+start_mongodb() {
+    log "Starting MongoDB"
+    systemctl daemon-reload
+    systemctl enable mongod
+    systemctl start mongod
+    systemctl is-active --quiet mongod || fatal "MongoDB failed to start"
+}
+
+init_replica_set() {
+    echo
+    read -r -p "Is this node the MongoDB replica set initiator? [yes/no]: " reply
+    [[ "$reply" != "yes" ]] && return
+
+    read -r -p "Enter replica set members (host:port), comma-separated: " members
+    [[ -z "$members" ]] && fatal "No replica set members provided"
+
+    log "Initializing MongoDB replica set"
+
+    mongosh --quiet --eval "
+rs.initiate({
+  _id: \"rs0\",
+  members: [
+    $(echo "$members" | awk -F, '{
+      for (i=1;i<=NF;i++)
+        printf("{ _id: %d, host: \"%s\" }%s", i-1, $i, (i<NF?",":""))
+    }')
+  ]
+})
+"
+}
+
+# ==================================================
 # Main
 # ==================================================
 main() {
     touch "$LOGFILE"
-    log "Starting Graylog installer (combined v3)"
+    log "Starting Graylog installer (combined, MongoDB-ready)"
 
     check_root
     check_os
@@ -226,9 +305,18 @@ main() {
     install_java_21
     verify_prerequisites
 
-    log "Prerequisites successfully applied"
+    if [[ "$ROLE" == "server" ]]; then
+        install_mongodb_prereqs
+        add_mongodb_repo
+        install_mongodb
+        configure_mongodb
+        start_mongodb
+        init_replica_set
+    fi
+
+    log "Installation phase completed successfully"
     echo
-    echo "System is ready for MongoDB and Graylog installation."
+    echo "System is now ready for Graylog Data Node and Graylog Server installation."
 }
 
 main
