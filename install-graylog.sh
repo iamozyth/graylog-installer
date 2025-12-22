@@ -385,7 +385,7 @@ check_connectivity_archive() {
 
   # Secondary: ICMP ping, informational only
   if command -v ping >/dev/null 2>&1; then
-    if ping -c 1 -W 1 archive.ubuntu.com >/dev/null 2>&1; then
+    if ping -c 3 archive.ubuntu.com >/dev/null 2>&1; then
       ICMP_ARCHIVE_OK="yes"
       add_info "ICMP ping to archive.ubuntu.com succeeded."
     else
