@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
 # ==================================================
-# Self-elevation (must be first)
+# Self-elevation (MUST be first, before set -e)
 # ==================================================
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "[INFO] Script not running as root. Re-running with sudo..."
+    echo "[INFO] Not running as root, re-executing with sudo..."
     exec sudo -E bash "$0" "$@"
 fi
+
+set -euo pipefail
 
 # ==================================================
 # Global configuration
@@ -32,14 +33,16 @@ NTP_SYNC=""
 CURRENT_MAX_MAP_COUNT=""
 
 # ==================================================
-# Helpers
+# Logging helpers (safe)
 # ==================================================
 log() {
-    echo "[INFO] $1" | tee -a "$LOGFILE"
+    echo "[INFO] $1"
+    echo "[INFO] $1" >>"$LOGFILE"
 }
 
 fatal() {
-    echo "[ERROR] $1" | tee -a "$LOGFILE"
+    echo "[ERROR] $1"
+    echo "[ERROR] $1" >>"$LOGFILE"
     exit 1
 }
 
@@ -103,7 +106,7 @@ inspect_java() {
 
 inspect_avx() {
     [[ "$ROLE" != "server" ]] && AVX_SUPPORTED="n/a" && return
-    grep -q avx /proc/cpuinfo || fatal "CPU lacks AVX support (required for MongoDB 8.x)"
+    grep -q avx /proc/cpuinfo || fatal "CPU lacks AVX support (MongoDB 8.x requirement)"
     AVX_SUPPORTED="yes"
 }
 
@@ -199,89 +202,6 @@ verify_prerequisites() {
 }
 
 # ==================================================
-# Phase 4 – MongoDB 8.x installation (server only)
-# ==================================================
-install_mongodb_prereqs() {
-    log "Installing MongoDB prerequisites"
-    apt install -y gnupg curl
-}
-
-add_mongodb_repo() {
-    log "Adding MongoDB 8.0 repository"
-
-    curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | \
-        gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
-
-    echo "deb [ arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] \
-https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" \
-        >/etc/apt/sources.list.d/mongodb-org-8.0.list
-
-    apt update
-}
-
-install_mongodb() {
-    log "Installing MongoDB 8.x"
-    apt install -y mongodb-org
-    apt-mark hold mongodb-org
-}
-
-configure_mongodb() {
-    log "Configuring MongoDB"
-    cp /etc/mongod.conf /etc/mongod.conf.graylog.bak
-
-    cat >/etc/mongod.conf <<EOF
-storage:
-  dbPath: /var/lib/mongodb
-
-systemLog:
-  destination: file
-  logAppend: true
-  path: /var/log/mongodb/mongod.log
-
-net:
-  port: 27017
-  bindIpAll: true
-
-replication:
-  replSetName: "rs0"
-
-processManagement:
-  timeZoneInfo: /usr/share/zoneinfo
-EOF
-}
-
-start_mongodb() {
-    log "Starting MongoDB"
-    systemctl daemon-reload
-    systemctl enable mongod
-    systemctl start mongod
-    systemctl is-active --quiet mongod || fatal "MongoDB failed to start"
-}
-
-init_replica_set() {
-    echo
-    read -r -p "Is this node the MongoDB replica set initiator? [yes/no]: " reply
-    [[ "$reply" != "yes" ]] && return
-
-    read -r -p "Enter replica set members (host:port), comma-separated: " members
-    [[ -z "$members" ]] && fatal "No replica set members provided"
-
-    log "Initializing MongoDB replica set"
-
-    mongosh --quiet --eval "
-rs.initiate({
-  _id: \"rs0\",
-  members: [
-    $(echo "$members" | awk -F, '{
-      for (i=1;i<=NF;i++)
-        printf("{ _id: %d, host: \"%s\" }%s", i-1, $i, (i<NF?",":""))
-    }')
-  ]
-})
-"
-}
-
-# ==================================================
 # Main
 # ==================================================
 main() {
@@ -310,18 +230,9 @@ main() {
     install_java_21
     verify_prerequisites
 
-    if [[ "$ROLE" == "server" ]]; then
-        install_mongodb_prereqs
-        add_mongodb_repo
-        install_mongodb
-        configure_mongodb
-        start_mongodb
-        init_replica_set
-    fi
-
-    log "Installation phase completed successfully"
+    log "Prerequisites successfully applied"
     echo
-    echo "System is now ready for Graylog Data Node and Graylog Server installation."
+    echo "System is now ready for MongoDB and Graylog installation."
 }
 
 main
