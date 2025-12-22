@@ -2,6 +2,14 @@
 set -euo pipefail
 
 # ==================================================
+# Self-elevation (must be first)
+# ==================================================
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "[INFO] Script not running as root. Re-running with sudo..."
+    exec sudo -E bash "$0" "$@"
+fi
+
+# ==================================================
 # Global configuration
 # ==================================================
 LOGFILE="/var/log/graylog-installer.log"
@@ -43,10 +51,6 @@ confirm() {
 # ==================================================
 # Phase 1 – Read-only preflight
 # ==================================================
-check_root() {
-    [[ "$EUID" -eq 0 ]] || fatal "This script must be run as root"
-}
-
 check_os() {
     source /etc/os-release
     [[ "$ID" == "ubuntu" ]] || fatal "Unsupported OS: $ID"
@@ -60,7 +64,9 @@ check_systemd() {
 }
 
 check_apt() {
-    fuser /var/lib/dpkg/lock >/dev/null 2>&1 && fatal "apt is locked"
+    if fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
+        fatal "apt is locked by another process"
+    fi
 }
 
 select_role() {
@@ -282,7 +288,6 @@ main() {
     touch "$LOGFILE"
     log "Starting Graylog installer (combined, MongoDB-ready)"
 
-    check_root
     check_os
     check_systemd
     check_apt
