@@ -11,6 +11,17 @@ fi
 set -euo pipefail
 
 # ==================================================
+# Script metadata
+# ==================================================
+SCRIPT_NAME="Graylog Open Installer"
+SCRIPT_VERSION="v0.4"
+SCRIPT_SCOPE="Preflight + prerequisite correction + MongoDB 8.0 (server role)"
+SUPPORTED_OS="Ubuntu Server 22.04 (jammy) and 24.04 (noble)"
+GRAYLOG_TARGET="Graylog Open 7.x (latest)"
+MONGODB_TARGET="MongoDB 8.0.x (replica set supported)"
+JAVA_TARGET="OpenJDK 21 (headless)"
+
+# ==================================================
 # Error reporting
 # ==================================================
 LOGFILE="/var/log/graylog-installer.log"
@@ -61,12 +72,22 @@ MIN_RAM_SERVER_GB_WARN=8
 MIN_CPU_DATANODE_WARN=8
 MIN_RAM_DATANODE_GB_WARN=16
 
+# MongoDB
+MONGO_RS_NAME="rs0"
+MONGO_PORT="27017"
+MONGO_KEYRING="/usr/share/keyrings/mongodb-server-8.0.gpg"
+MONGO_LIST="/etc/apt/sources.list.d/mongodb-org-8.0.list"
+MONGO_PGP_URL="https://www.mongodb.org/static/pgp/server-8.0.asc"
+MONGO_REPO_BASE="https://repo.mongodb.org/apt/ubuntu"
+
 # ==================================================
 # State variables (preflight)
 # ==================================================
 ROLE=""
 
 UBUNTU_VERSION="unknown"
+UBUNTU_CODENAME="unknown"
+
 AVX_SUPPORTED="unknown"
 JAVA_PRESENT="unknown"
 JAVA_VERSION="n/a"
@@ -129,6 +150,36 @@ ui_ok()   { echo "   ${C_GREEN}OK${C_RESET}   $1"; }
 ui_warn() { echo "   ${C_YELLOW}WARN${C_RESET} $1"; }
 ui_fail() { echo "   ${C_RED}FAIL${C_RESET} $1"; }
 
+print_intro() {
+  echo
+  echo "${C_BOLD}${SCRIPT_NAME}${C_RESET} ${C_DIM}${SCRIPT_VERSION}${C_RESET}"
+  echo "${C_DIM}${SCRIPT_SCOPE}${C_RESET}"
+  echo
+  echo "${C_BOLD}Targets${C_RESET}"
+  echo "  - ${GRAYLOG_TARGET}"
+  echo "  - ${MONGODB_TARGET} (server role only; AVX required)"
+  echo "  - ${JAVA_TARGET}"
+  echo
+  echo "${C_BOLD}Supported OS${C_RESET}"
+  echo "  - ${SUPPORTED_OS}"
+  echo
+  echo "${C_BOLD}What this script does${C_RESET}"
+  echo "  1) Runs read-only preflight checks (system, hardware, basic network, prerequisites)"
+  echo "  2) Shows a color-coded report (FAIL/WARN/INFO)"
+  echo "  3) Waits for explicit confirmation before making changes"
+  echo "  4) Applies prerequisites:"
+  echo "     - Timezone: ${REQUIRED_TZ}"
+  echo "     - NTP: default German pool or custom input"
+  echo "     - vm.max_map_count: ${REQUIRED_MAX_MAP_COUNT}"
+  echo "     - Java: ${JAVA_PACKAGE}"
+  echo "  5) On server role only: installs MongoDB 8.0 and optionally initializes replica set ${MONGO_RS_NAME}"
+  echo
+  echo "${C_BOLD}Safety${C_RESET}"
+  echo "  - No system changes occur before you confirm."
+  echo "  - Intended for clean, first-time installs (existing Graylog/MongoDB causes a hard stop)."
+  echo
+}
+
 # ==================================================
 # Preflight: base checks (read-only)
 # ==================================================
@@ -153,10 +204,18 @@ check_os() {
     add_fail "Unsupported architecture: $(uname -m) (supported: x86_64)"
   fi
 
+  UBUNTU_CODENAME="${VERSION_CODENAME:-unknown}"
   if command -v lsb_release >/dev/null 2>&1; then
     UBUNTU_VERSION="$(lsb_release -rs 2>/dev/null || echo "${VERSION_ID:-unknown}")"
+    if [[ "$UBUNTU_CODENAME" == "unknown" ]]; then
+      UBUNTU_CODENAME="$(lsb_release -cs 2>/dev/null || echo "${VERSION_CODENAME:-unknown}")"
+    fi
   else
     UBUNTU_VERSION="${VERSION_ID:-unknown}"
+  fi
+
+  if [[ "$UBUNTU_CODENAME" != "jammy" && "$UBUNTU_CODENAME" != "noble" ]]; then
+    add_fail "Unsupported Ubuntu codename: $UBUNTU_CODENAME (expected jammy or noble)."
   fi
 }
 
@@ -227,7 +286,6 @@ inspect_existing_software() {
     add_fail "MongoDB already installed (clean install required)."
   fi
 
-  # dpkg grep must be inside if; no pipefail surprises
   if dpkg -l 2>/dev/null | grep -qE '^(ii|hi)\s+graylog'; then
     add_fail "Graylog packages already installed (clean install required)."
   fi
@@ -291,7 +349,6 @@ inspect_hardware() {
 inspect_disk() {
   ROOT_FREE_GB="$(df -BG / 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4}' || echo "unknown")"
 
-  # Extra disk heuristic: any disk device excluding root’s parent disk
   local root_src root_base
   root_src="$(findmnt -n -o SOURCE / 2>/dev/null || echo "")"
   root_base="$(lsblk -no PKNAME "$root_src" 2>/dev/null || true)"
@@ -320,7 +377,6 @@ inspect_disk() {
 }
 
 evaluate_hardware_requirements() {
-  # Root free
   if is_uint "$ROOT_FREE_GB"; then
     if (( ROOT_FREE_GB < MIN_ROOT_FREE_GB_FAIL )); then
       add_fail "Low free space on / (${ROOT_FREE_GB}G). Require at least ${MIN_ROOT_FREE_GB_FAIL}G free."
@@ -331,7 +387,6 @@ evaluate_hardware_requirements() {
     add_warn "Could not determine free space on /."
   fi
 
-  # CPU/RAM warnings per role
   if [[ "$ROLE" == "server" ]]; then
     if is_uint "$CPU_CORES" && (( CPU_CORES < MIN_CPU_SERVER_WARN )); then
       add_warn "CPU cores: ${CPU_CORES} (recommended >= ${MIN_CPU_SERVER_WARN} for server)."
@@ -360,13 +415,15 @@ evaluate_hardware_requirements() {
 # Network checks (minimal but critical)
 # ==================================================
 inspect_network() {
-  if command -v ip >/dev/null 2>&1; then
-    IFACE_SUMMARY="$(ip -br addr 2>/dev/null | awk '$1!="lo"{print}' | sed 's/[[:space:]]\+/ /g' || true)"
-    PRIMARY_IFACES="$(ip -br link 2>/dev/null | awk '$1!="lo" && $2=="UP"{print $1}' || true)"
-    DEFAULT_GW="$(ip route show default 2>/dev/null | awk 'NR==1{print $3}' || echo "none")"
+  if ! command -v ip >/dev/null 2>&1; then
+    add_fail "'ip' command not available; cannot validate network configuration."
+    return
   fi
 
-  # DHCP detection (netplan signal)
+  IFACE_SUMMARY="$(ip -br addr 2>/dev/null | awk '$1!="lo"{print}' | sed 's/[[:space:]]\+/ /g' || true)"
+  PRIMARY_IFACES="$(ip -br link 2>/dev/null | awk '$1!="lo" && $2=="UP"{print $1}' || true)"
+  DEFAULT_GW="$(ip route show default 2>/dev/null | awk 'NR==1{print $3}' || echo "none")"
+
   if ls /etc/netplan/*.yaml >/dev/null 2>&1; then
     if grep -R "dhcp4:\s*true" /etc/netplan/*.yaml >/dev/null 2>&1; then
       DHCP_DETECTED="yes"
@@ -377,18 +434,13 @@ inspect_network() {
     DHCP_DETECTED="unknown"
   fi
 
-  # Basic IP and gateway
-  if command -v ip >/dev/null 2>&1; then
-    local ipv4_count
-    ipv4_count="$(ip -4 -br addr 2>/dev/null | awk '$1!="lo" && $3!=""{c++} END{print c+0}' || echo 0)"
-    if ! is_uint "$ipv4_count" || (( ipv4_count == 0 )); then
-      add_fail "No IPv4 address configured on non-loopback interfaces."
-    fi
-  else
-    add_fail "'ip' command not available; cannot validate network configuration."
+  local ipv4_count
+  ipv4_count="$(ip -4 -br addr 2>/dev/null | awk '$1!="lo" && $3!=""{c++} END{print c+0}' || echo 0)"
+  if ! is_uint "$ipv4_count" || (( ipv4_count == 0 )); then
+    add_fail "No IPv4 address configured on non-loopback interfaces."
   fi
 
-  if [[ "$DEFAULT_GW" == "none" || -z "$DEFAULT_GW" || "$DEFAULT_GW" == "unknown" ]]; then
+  if [[ "$DEFAULT_GW" == "none" || -z "$DEFAULT_GW" ]]; then
     add_fail "No default gateway configured (no default route)."
   fi
 
@@ -396,7 +448,7 @@ inspect_network() {
     add_warn "DHCP appears enabled in netplan (not ideal for server deployments)."
   fi
 
-  if [[ -z "${PRIMARY_IFACES:-}" || "${PRIMARY_IFACES:-}" == "unknown" ]]; then
+  if [[ -z "${PRIMARY_IFACES:-}" ]]; then
     add_warn "No UP ethernet interfaces detected (excluding lo)."
   fi
 }
@@ -411,7 +463,6 @@ check_dns_archive() {
 }
 
 check_connectivity_archive() {
-  # Primary indicator: HTTP HEAD (ICMP may be blocked)
   if command -v curl >/dev/null 2>&1; then
     if curl -fsSLI --max-time 8 http://archive.ubuntu.com/ubuntu/ >/dev/null 2>&1; then
       HTTP_ARCHIVE_OK="yes"
@@ -424,7 +475,6 @@ check_connectivity_archive() {
     add_warn "curl not installed; HTTP connectivity test skipped in preflight."
   fi
 
-  # ICMP informational only
   if command -v ping >/dev/null 2>&1; then
     if ping -c 1 -W 1 archive.ubuntu.com >/dev/null 2>&1; then
       ICMP_ARCHIVE_OK="yes"
@@ -448,7 +498,7 @@ print_preflight_report() {
   echo "${C_BOLD}=================================================${C_RESET}"
 
   echo "${C_BOLD}System${C_RESET}"
-  echo "  OS:                Ubuntu ${UBUNTU_VERSION}"
+  echo "  OS:                Ubuntu ${UBUNTU_VERSION} (${UBUNTU_CODENAME})"
   echo "  Role:              ${ROLE}"
   echo "  CPU cores:         ${CPU_CORES}"
   echo "  RAM:               ${RAM_GB}G"
@@ -500,6 +550,9 @@ print_preflight_report() {
   echo "  - Configure NTP (default German pool or custom)"
   echo "  - Set vm.max_map_count → $REQUIRED_MAX_MAP_COUNT"
   echo "  - Install Java 21 ($JAVA_PACKAGE)"
+  if [[ "$ROLE" == "server" ]]; then
+    echo "  - Install MongoDB 8.0 and configure replica set ($MONGO_RS_NAME)"
+  fi
   echo "${C_BOLD}=================================================${C_RESET}"
   echo
 }
@@ -556,7 +609,6 @@ apply_vm_max_map_count() {
 
 install_java_21() {
   log "Installing Java 21"
-  # apt lock may appear between preflight and install; re-check here
   check_apt_with_wait
   apt update
   apt install -y "$JAVA_PACKAGE"
@@ -577,11 +629,141 @@ verify_prerequisites() {
 }
 
 # ==================================================
+# Phase 4 – MongoDB 8.0 (server only)
+# ==================================================
+install_mongodb_prereqs() {
+  log "Installing MongoDB prerequisites (gnupg, curl)"
+  check_apt_with_wait
+  apt install -y gnupg curl
+}
+
+import_mongodb_key() {
+  log "Importing MongoDB 8.0 public key"
+  mkdir -p "$(dirname "$MONGO_KEYRING")"
+  curl -fsSL "$MONGO_PGP_URL" | gpg --dearmor -o "$MONGO_KEYRING"
+}
+
+add_mongodb_repo() {
+  log "Adding MongoDB 8.0 repository for Ubuntu ${UBUNTU_CODENAME}"
+  echo "deb [ arch=amd64 signed-by=${MONGO_KEYRING} ] ${MONGO_REPO_BASE} ${UBUNTU_CODENAME}/mongodb-org/8.0 multiverse" >"$MONGO_LIST"
+  check_apt_with_wait
+  apt update
+}
+
+install_mongodb() {
+  log "Installing MongoDB (mongodb-org)"
+  check_apt_with_wait
+  apt install -y mongodb-org
+  apt-mark hold mongodb-org
+}
+
+configure_mongodb() {
+  log "Configuring MongoDB (bindIpAll + replica set: ${MONGO_RS_NAME})"
+
+  if [[ -f /etc/mongod.conf ]]; then
+    cp /etc/mongod.conf "/etc/mongod.conf.graylog.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+
+  cat >/etc/mongod.conf <<EOF
+storage:
+  dbPath: /var/lib/mongodb
+
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+
+net:
+  port: ${MONGO_PORT}
+  bindIpAll: true
+
+replication:
+  replSetName: "${MONGO_RS_NAME}"
+
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+EOF
+}
+
+start_mongodb() {
+  log "Enabling and starting mongod"
+  systemctl daemon-reload
+  systemctl enable mongod.service
+  systemctl start mongod.service
+
+  if ! systemctl is-active --quiet mongod.service; then
+    systemctl status mongod.service --no-pager || true
+    fatal "MongoDB failed to start."
+  fi
+}
+
+build_rs_members_js() {
+  local raw="$1"
+  local cleaned="${raw// /}"
+  local IFS=','
+  # shellcheck disable=SC2206
+  local parts=($cleaned)
+
+  if (( ${#parts[@]} < 1 )); then
+    echo ""
+    return 1
+  fi
+
+  local js=""
+  local idx=0
+  local hostport=""
+  for hostport in "${parts[@]}"; do
+    [[ -z "$hostport" ]] && continue
+    if [[ "$hostport" != *:* ]]; then
+      hostport="${hostport}:${MONGO_PORT}"
+    fi
+    if [[ -n "$js" ]]; then
+      js+=", "
+    fi
+    js+="{ _id: ${idx}, host: \"${hostport}\" }"
+    idx=$((idx+1))
+  done
+
+  echo "$js"
+  return 0
+}
+
+init_replica_set() {
+  echo
+  read -r -p "Is this node the MongoDB replica set initiator? [yes/no]: " reply
+  if [[ "$reply" != "yes" ]]; then
+    log "Skipping replica set initiation on this node."
+    return
+  fi
+
+  echo
+  echo "${C_BOLD}Replica set initiation${C_RESET}"
+  echo "Enter members as comma-separated hostnames/IPs (port optional). Examples:"
+  echo "  graylog01,graylog02,graylog03"
+  echo "  graylog01:27017,graylog02:27017,graylog03:27017"
+  read -r -p "Members: " members
+  [[ -z "$members" ]] && fatal "No replica set members provided."
+
+  local members_js
+  members_js="$(build_rs_members_js "$members")"
+  [[ -z "$members_js" ]] && fatal "Failed to parse replica set members."
+
+  log "Initiating replica set ${MONGO_RS_NAME}"
+  if ! mongosh --quiet --eval "rs.initiate({ _id: \"${MONGO_RS_NAME}\", members: [ ${members_js} ] })"; then
+    fatal "Replica set initiation failed. Verify name resolution and connectivity between nodes on port ${MONGO_PORT}."
+  fi
+
+  log "Replica set initiation command executed."
+}
+
+# ==================================================
 # Main
 # ==================================================
 main() {
   init_log
-  log "Starting Graylog installer (preflight + prerequisites)"
+  log "Starting Graylog installer (${SCRIPT_VERSION})"
+
+  print_intro
 
   echo "${C_CYAN}${C_BOLD}Preflight checks are running. Please be patient...${C_RESET}"
   echo "${C_DIM}This may take a short time (apt lock checks, DNS/connectivity tests).${C_RESET}"
@@ -619,10 +801,24 @@ main() {
   apply_vm_max_map_count
   install_java_21
   verify_prerequisites
-
   log "Prerequisites successfully applied"
+
+  if [[ "$ROLE" == "server" ]]; then
+    log "Phase 4: Installing MongoDB 8.0"
+    install_mongodb_prereqs
+    import_mongodb_key
+    add_mongodb_repo
+    install_mongodb
+    configure_mongodb
+    start_mongodb
+    init_replica_set
+    log "MongoDB installation completed"
+  else
+    log "Role is datanode; skipping MongoDB installation."
+  fi
+
   echo
-  echo "${C_GREEN}${C_BOLD}Prerequisites are now corrected.${C_RESET} Next phases will install MongoDB/Graylog/Data Node."
+  echo "${C_GREEN}${C_BOLD}Completed.${C_RESET} Next phases will install Graylog Data Node and Graylog Server."
 }
 
 main
